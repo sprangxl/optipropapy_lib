@@ -5,11 +5,7 @@ import csv
 # external libraries
 import numpy as np
 import scipy.linalg as la
-import matplotlib.pyplot as plt
 from pathlib import Path
-
-# animation libraries
-from matplotlib.animation import FuncAnimation, PillowWriter
 
 
 # randomly gen space objects desired for detection
@@ -52,11 +48,27 @@ def gen_sourcefield_obj(n, sz, obj_sz, obj_xoff, obj_yoff, lu):
     # initialize source field array
     field_s = np.zeros((n + 1, n + 1))
 
+    # generate object with specific size and location
     xms, yms = np.meshgrid(x, x)
     mask = np.sqrt((xms-obj_xoff)**2 + (yms-obj_yoff)**2) < obj_sz
-    field_s[mask] = 1
+    field_s[mask] = lu
 
     return field_s, x
+
+
+# create object with pixel at a specific point (offset from center)
+def gen_sourcefield_pts(n, x_off, y_off, lu):
+    # create field coordinates
+    x_c = int(n / 2)
+    y_c = int(n / 2)
+
+    # initialize source field array
+    field_s = np.zeros((n + 1, n + 1))
+
+    # generate object with specific size and location
+    field_s[int(y_c + y_off), int(x_c + x_off)] = lu
+
+    return field_s
 
 
 # fresnel propagation utilizing fft
@@ -104,10 +116,6 @@ def fraunhofer_prop(field_s, xs_crd, zo, lam, focus_flag):
 # use rayleigh sommerfeld propagation on given source field
 def rayleigh_sommerfeld_prop(field_s, xs_crd, zo, lam, n_r, sz_r, xc, yc):
     xs_mgrid, ys_mgrid = np.meshgrid(xs_crd, xs_crd)  # meshgrids for source x & y
-
-    # Troubleshooting: use different method to generate coordinates
-    # xr_crd = np.arange(-np.floor(sz_r / 2), np.ceil(sz_r / 2)) * dx_r + xc  # array of received x-coordinates
-    # yr_crd = np.arange(-np.floor(sz_r / 2), np.ceil(sz_r / 2)) * dx_r + yc  # array of received y-coordinates
 
     xr_crd = np.arange(-sz_r / 2, (sz_r / 2) + (sz_r / n_r), sz_r / n_r) + xc
     yr_crd = np.arange(-sz_r / 2, (sz_r / 2) + (sz_r / n_r), sz_r / n_r) + yc
@@ -175,19 +183,20 @@ def sq_mask(n, sz, x_diam, y_diam):
 
 # make an otf of a pupil function with inner radius (radius2_px) and outer radius (radius1_px)
 def make_otf(radius1_px, radius2_px, source_px, scale, phase):
+    # generate an aperture
     aperture = np.zeros((source_px, source_px))
     coords = np.linspace(-source_px/2, source_px/2, source_px)
     xmat, ymat = np.meshgrid(coords, coords)
     distance_sq = (xmat**2 + ymat**2)
-
     aperture[distance_sq <= radius1_px**2] = 1
     aperture[distance_sq < radius2_px**2] = 0
 
-    pupil = aperture * np.cos(phase) + 1j * (aperture * np.sin(phase))
-    psf = np.real(np.fft.fft2(pupil)*np.conj(np.fft.fft2(pupil)))
+    # generate pupil and psf from aperture
+    pupil = aperture * np.exp(1j * phase)
+    pupil_fft = np.fft.fft2(pupil)
+    psf = np.real(pupil_fft * np.conj(pupil_fft))  # multiply by conjugate is real valued, 'np.real' for correct dtype
     psf = scale * psf / np.sum(pupil.flatten())
 
-    print('done')
     return np.fft.fft2(psf), aperture
 
 
@@ -207,14 +216,14 @@ def zern_phase_scrn(ro, d, nn, zern_mx, x_crd, windx, windy, boil, deltat, frame
 def general_phase_screen(nn, zern_mx, zern, ch):
     # create random numbers to scale zernike polynomials
     rn = np.random.normal(size=(zern_mx - 1, 1))
-    z_cf = np.matmul(ch, rn)
+    z_coef = np.matmul(ch, rn)
 
     # initialize zernike phase screen
     zern_phs = np.zeros((nn + 1, nn + 1))
 
     # summations of randomly scaled zernike polynomials
     for ii in np.arange(0, zern_mx - 1):
-        zern_phs = zern_phs + z_cf[ii] * zern[ii, :, :]
+        zern_phs = zern_phs + z_coef[ii] * zern[ii, :, :]
 
     return zern_phs
 
@@ -222,6 +231,10 @@ def general_phase_screen(nn, zern_mx, zern, ch):
 # creates phase screens based on zernike polynom,ials and atmospheric variables
 def atmos_phase_screen(nn, ro, x_crd, windx, windy, boil, deltat, zern_mx, zern, ch, frames):
     a = 6.88
+
+    # increase size of the zernike polynomial spaces to allow for correlation calcs
+    zern2 = np.zeros((zern_mx - 1, nn + 1, nn + 1))
+    zern2[:, int(nn / 4):int(3 * nn / 4 + 1), int(nn / 4):int(3 * nn / 4 + 1)] = zern
 
     # get phase structure
     xm, ym = np.meshgrid(x_crd, x_crd)  # tau_x, tau_y
@@ -231,12 +244,12 @@ def atmos_phase_screen(nn, ro, x_crd, windx, windy, boil, deltat, zern_mx, zern,
     # denominator, Zernike sum of squares
     dnm = np.zeros((zern_mx - 1))
     for xx in np.arange(0, zern_mx - 1):
-        dnm[xx] = np.sum(np.sum(zern[xx, :, :] ** 2))
+        dnm[xx] = np.sum(np.sum(zern2[xx, :, :] ** 2))
 
     # FFT of all zernikes
     fft_mat = np.zeros((nn + 1, nn + 1, zern_mx - 1)) + 0j
     for jj in np.arange(0, zern_mx - 1):
-        fft_mat[:, :, jj] = np.fft.fft2(np.fft.fftshift(zern[jj, :, :]))
+        fft_mat[:, :, jj] = np.fft.fft2(np.fft.fftshift(zern2[jj, :, :]))
 
     # inner double sum integral
     idsi = np.zeros((zern_mx - 1, zern_mx - 1))
@@ -244,22 +257,19 @@ def atmos_phase_screen(nn, ro, x_crd, windx, windy, boil, deltat, zern_mx, zern,
         for yy in np.arange(0, zern_mx - 1):
             xcorr_fft = np.real(np.fft.fftshift(np.fft.ifft2(fft_mat[:, :, xx] * fft_mat[:, :, yy].conj())))
             idsi[xx, yy] = np.sum(np.sum(xcorr_fft * phs_struct / (dnm[xx] * dnm[yy])))
-            # For Troubleshooting: check xcorr results
-            # xcorr = signal.correlate2d(zern[xx, :, :], zern[yy, :, :])
-            # idsi[xx, yy] = np.sum(np.sum(xcorr * phs_struct / (dnm[xx] * dnm[yy])))
 
     # get n structure function from the phase structure function differences
     phi = la.inv(ch)
-    dn = np.zeros(zern_mx-1)
-    temp = np.zeros((zern_mx-1, zern_mx-1, zern_mx-1))
+    d_n = np.zeros(zern_mx-1)
+    phi_out = np.zeros((zern_mx-1, zern_mx-1, zern_mx-1))
     for ii in range(0, zern_mx-1):
-        temp[:, :, ii] = np.outer(phi[ii, :], phi[ii, :])
-        dn[ii] = np.sum(np.sum(idsi * temp[:, :, ii]))
+        phi_out[:, :, ii] = np.outer(phi[ii, :], phi[ii, :])
+        d_n[ii] = np.sum(np.sum(idsi * phi_out[:, :, ii]))
 
     # get the n-vector, and correlation functions
     r_0 = 1
-    r_n = r_0 - dn/2
-    r_n = np.clip(r_n, a_min=0, a_max=None).reshape((1, zern_mx-1))
+    r_n = r_0 - d_n/2
+    r_n = np.clip(r_n, a_min=0, a_max=1).reshape((1, zern_mx-1))
     n_vec = np.random.normal(size=(1, zern_mx - 1))
     cond_var = 1 - r_n**2
     cond_var = cond_var.reshape((1, zern_mx-1))
@@ -272,35 +282,10 @@ def atmos_phase_screen(nn, ro, x_crd, windx, windy, boil, deltat, zern_mx, zern,
         z_scale = ch @ n_vec.T
         z_record[:, ii] = np.squeeze(z_scale)
         for jj in np.arange(0, zern_mx - 1):
-            atm_lens_phs = atm_lens_phs + z_scale[jj] * zern[jj, :, :]
+            atm_lens_phs = atm_lens_phs + z_scale[jj] * zern2[jj, :, :]
         screens[:, :, ii] = atm_lens_phs
         cond_mean = n_vec * r_n
         n_vec = np.sqrt(cond_var) * np.random.normal(size=(zern_mx-1)) + cond_mean
-
-    # check what the screens look like (when flags == True) for toubleshooting only
-    check_screens_flag = False
-    create_animation_flag = False
-
-    # plot first four frames of phase screen
-    if check_screens_flag:
-        step = int(frames/4)  # assumes number of frames divisible by 4
-        fig, ax = plt.subplots(4, step)
-        for ii in range(0, 4):
-            for jj in range(0,  step):
-                ax[ii, jj].imshow(screens[:, :, jj + ii*4])
-                ax[ii, jj].axes.xaxis.set_visible(False)
-                ax[ii, jj].axes.yaxis.set_visible(False)
-        plt.tight_layout()
-        plt.show()
-
-    # create and save animation as animated gif
-    if create_animation_flag:
-        fig = plt.figure()
-        def AnimationFunction(f):
-            plt.imshow(screens[:, :, f])
-        ani = FuncAnimation(fig, AnimationFunction, frames=frames, interval=50)
-        writer = PillowWriter(fps=10)
-        ani.save('screens.gif', writer=writer)
 
     return screens
 
@@ -309,7 +294,7 @@ def atmos_phase_screen(nn, ro, x_crd, windx, windy, boil, deltat, zern_mx, zern,
 def generate_zern_polys(zern_mx, nn, d, ro):
     k = 2.2698
 
-    # create zernicke
+    # create zernike
     zern, idx = zern_poly(zern_mx + 1, nn)
     zern = zern[1: zern_mx, :, :]
 
@@ -331,8 +316,8 @@ def generate_zern_polys(zern_mx, nn, d, ro):
             test3 = p_even == p_p_even
             test0 = test2 | test3
             if test1 and test0:
-                k_zz = k * np.power(-1, (n[xx] + n[yy] - (2 * m[xx])) / 2) * np.sqrt((n[xx] + 1) * (n[xx] + 1))
-                num = k_zz * math.gamma((n[xx] + n[yy] - (5 / 3)) / 2) * np.power(d / ro, 5 / 3)
+                k_zz = k * (-1)**((n[xx] + n[yy] - (2 * m[xx])) / 2) * np.sqrt((n[xx] + 1) * (n[yy] + 1))
+                num = k_zz * math.gamma((n[xx] + n[yy] - (5 / 3)) / 2) * (d / ro)**(5 / 3)
                 dnm = math.gamma((n[xx] - n[yy] + 17 / 3) / 2) * math.gamma((n[yy] - n[xx] + 17 / 3) / 2) * \
                       math.gamma((n[xx] + n[yy] + 23 / 3) / 2)
                 covar[xx, yy] = num / dnm
@@ -408,3 +393,20 @@ def zrf(n, m, r):
         dnm = math.factorial(ii) * math.factorial(((n + m) / 2) - ii) * math.factorial(((n - m) / 2) - ii)
         rr = rr + (num / dnm) * r ** (n - (2 * ii))
     return rr
+
+
+# takes in data, 2D intensity array, and its (number of iterations)
+def gerschberg_saxton_phase_retrieve(data, its):
+    sz = np.shape(data)
+    source = np.sqrt(data)
+    source_fft = np.fft.fftshift(np.fft.fft2(np.fft.fftshift(source)))
+    target_ifft = np.fft.fftshift(
+        np.fft.ifft2(np.fft.fftshift(np.exp(1j * np.random.uniform(-np.pi, np.pi, sz)))))  # random initialization
+
+    for it in range(its):
+        source_est = np.abs(source) * np.exp(1j * np.angle(target_ifft))
+        source_est_fft = np.fft.fftshift(np.fft.fft2(np.fft.fftshift(source_est)))
+        target_est = np.abs(source_fft) * np.exp(1j * np.angle(source_est_fft))
+        target_ifft = np.fft.fftshift(np.fft.ifft2(np.fft.fftshift(target_est)))
+
+    return source_est
