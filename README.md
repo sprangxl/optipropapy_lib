@@ -31,8 +31,12 @@ ZERNIKE PHASE SCREEN FUNCTIONS (Tabs indicate sub-functions):
         atmos_phase_screen
 
     generate_zern_polys
-        zern_poly
+        zern_polye
             zern_indexes
             zrf
+
+PHASE RETRIEVAL
+
+    gerschberg_saxton_phase_retrieve
 
 Test script (tests/optipropapy_tests.py) runs an example scenario using the functions in the library# optipropapy_lib

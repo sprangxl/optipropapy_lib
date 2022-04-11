@@ -4,7 +4,7 @@ import csv
 
 # external libraries
 import numpy as np
-import scipy.linalg as la
+import numpy.linalg as la
 from pathlib import Path
 
 
