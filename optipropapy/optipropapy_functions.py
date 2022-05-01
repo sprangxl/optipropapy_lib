@@ -193,11 +193,11 @@ def make_otf(radius1_px, radius2_px, source_px, scale, phase):
 
     # generate pupil and psf from aperture
     pupil = aperture * np.exp(1j * phase)
-    pupil_fft = np.fft.fft2(pupil)
-    psf = np.real(pupil_fft * np.conj(pupil_fft))  # multiply by conjugate is real valued, 'np.real' for correct dtype
-    psf = scale * psf / np.sum(pupil.flatten())
+    pupil_ifft = np.fft.ifftshift(np.fft.ifft2(np.fft.ifftshift(pupil)))
+    psf = np.real(pupil_ifft * np.conj(pupil_ifft))  # multiply by conjugate is real valued, 'np.real' for correct dtype
+    psf = scale * psf / np.sum(psf.flatten())
 
-    return np.fft.fft2(psf), aperture
+    return np.fft.fftshift(np.fft.fft2(np.fft.fftshift(psf))), aperture
 
 
 # create phase screen from zernike polynomials
@@ -234,7 +234,7 @@ def atmos_phase_screen(nn, ro, x_crd, windx, windy, boil, deltat, zern_mx, zern,
 
     # increase size of the zernike polynomial spaces to allow for correlation calcs
     zern2 = np.zeros((zern_mx - 1, nn + 1, nn + 1))
-    zern2[:, int(nn / 4):int(3 * nn / 4 + 1), int(nn / 4):int(3 * nn / 4 + 1)] = zern
+    zern2[:, int(nn / 4):int(3 * nn / 4), int(nn / 4):int(3 * nn / 4)] = zern
 
     # get phase structure
     xm, ym = np.meshgrid(x_crd, x_crd)  # tau_x, tau_y
@@ -395,18 +395,125 @@ def zrf(n, m, r):
     return rr
 
 
+def distort_and_focus(source, otf, z, lam, x_coord):
+    # get varaibles of field coordinates
+    nn = np.size(x_coord)
+    ll = np.max(x_coord) - np.min(x_coord)
+
+    # get the light field as seen at the optic
+    source_fft = np.fft.fft2(source)
+    field = source_fft * otf
+
+    # focus the field to the detector
+    scale_fact = 1 / (lam * z)
+    image = scale_fact * np.fft.ifft2(field)
+
+    # get the new coordinates at the detector
+    ds = ll / nn + 1
+    xr_coord = np.linspace(-(1 / ds) / 2, (1 / ds) / 2, nn + 1) * (lam * z)
+
+    return image, xr_coord
+
+
 # takes in data, 2D intensity array, and its (number of iterations)
-def gerschberg_saxton_phase_retrieve(data, its):
-    sz = np.shape(data)
-    source = np.sqrt(data)
-    source_fft = np.fft.fftshift(np.fft.fft2(np.fft.fftshift(source)))
-    target_ifft = np.fft.fftshift(
-        np.fft.ifft2(np.fft.fftshift(np.exp(1j * np.random.uniform(-np.pi, np.pi, sz)))))  # random initialization
+def gerschberg_saxton_phase_retrieve(data, apt, its, phs_init):
+    point = np.sqrt(np.abs(data))
+    pupil = apt
+    pupil_phs = pupil * np.exp(1j * phs_init)
+    point_phs = np.fft.fft2(pupil_phs)
 
+    # iterate GS
     for it in range(its):
-        source_est = np.abs(source) * np.exp(1j * np.angle(target_ifft))
-        source_est_fft = np.fft.fftshift(np.fft.fft2(np.fft.fftshift(source_est)))
-        target_est = np.abs(source_fft) * np.exp(1j * np.angle(source_est_fft))
-        target_ifft = np.fft.fftshift(np.fft.ifft2(np.fft.fftshift(target_est)))
+        pupil_cmplx = np.abs(pupil) * np.exp(1j * np.angle(pupil_phs))
+        point_phs = np.fft.fft2(pupil_cmplx)
+        point_cmplx = np.abs(point) * np.exp(1j * np.angle(point_phs))
+        pupil_phs = np.fft.ifft2(point_cmplx)
 
-    return source_est
+    pupil_phs = np.angle(pupil_phs)
+    psf_phs = np.angle(point_phs)
+    return pupil_phs, psf_phs, np.abs(point_phs)
+
+
+def convert_to_psf_otf(phs_screen):
+    phase_fft = np.fft.fft2(phs_screen)
+    psf = np.abs(phase_fft)**2
+    psf = psf / np.sum(psf.flatten())
+    otf = np.fft.fft2(psf)
+
+    return psf, otf
+
+
+def maxlikelihood_deconvolution(nn, frames, data, defocus, its, gs_its, name, psf_t, phases_t, obj_t):
+    # initialize variables
+    ap_est = circ_mask(nn, 1, 0.5, 0)
+    ap_est = np.fft.fftshift(ap_est)
+    phs_est = np.array(defocus)
+    psf_est, otf_est = convert_to_psf_otf(ap_est * np.exp(1j * phs_est))  # initial psf and otf estimates
+    obj_est = np.ones((nn + 1, nn + 1))
+
+    psf_est = np.repeat(np.expand_dims(psf_est, 2), frames, axis=2)
+    otf_est = np.repeat(np.expand_dims(otf_est, 2), frames, axis=2)
+    phs_est = np.repeat(np.expand_dims(phs_est, 2), frames, axis=2)
+    bias_est = np.median(data.flatten())
+
+    img_est = np.zeros((nn + 1, nn + 1, frames))
+    ratio_fft_est = np.zeros((nn + 1, nn + 1, frames)) + 0j
+    obj_updt = np.zeros((nn + 1, nn + 1, frames))
+    psf_updt = np.zeros((nn + 1, nn + 1, frames))
+
+    # run iteration
+    for ii in range(its):
+        obj_fft_est = np.fft.fft2(obj_est)
+        for ff in range(frames):
+            # estimate the image function
+            img_est[:, :, ff] = np.real(np.fft.ifft2(obj_fft_est * otf_est[:, :, ff])) + bias_est
+
+            # the fourier transform of the data to image est ratio
+            ratio_fft_est[:, :, ff] = np.fft.fft2(data[:, :, ff] / img_est[:, :, ff])
+
+            # estimate the update for the object function
+            obj_updt[:, :, ff] = np.real(np.fft.ifft2(ratio_fft_est[:, :, ff] * otf_est[:, :, ff].conj()))
+
+            # estimate the update for the psf
+            psf_updt[:, :, ff] = np.real(np.fft.ifft2(ratio_fft_est[:, :, ff] * obj_fft_est.conj()))
+
+            # get the new psf from the update
+            psf_est[:, :, ff] = np.abs(np.fft.ifft2(otf_est[:, :, ff])) * psf_updt[:, :, ff]
+            psf_est[:, :, ff] = psf_est[:, :, ff] / np.sum(psf_est[:, :, ff].flatten())
+
+            # estimate the phase of the phase of the psf
+            phs_est[:, :, ff], pupil_phs, point_est = \
+                gerschberg_saxton_phase_retrieve(psf_est[:, :, ff], ap_est, gs_its, phs_est[:, :, ff])
+
+            # convert phase of the psf to the otf estimate
+            psf_gs_est, otf_est[:, :, ff] = convert_to_psf_otf(ap_est * np.exp(1j * phs_est[:, :, ff]))
+
+        print(name + f' Iteration: {ii+1}/{its}')
+
+        obj_est = obj_est * np.sum(obj_updt, 2) / frames
+
+    return obj_est, img_est, otf_est
+
+
+def known_psf_deconvolution(nn, frames, data, its, otf_real, name):
+    obj_est = np.ones((nn + 1, nn + 1))  # object estimate
+    bias_est = np.median(data.flatten())
+
+    img_est = np.zeros((nn + 1, nn + 1, frames))
+    ratio_fft_est = np.zeros((nn + 1, nn + 1, frames)) + 0j
+    obj_updt = np.zeros((nn + 1, nn + 1, frames))
+    for ii in range(its):
+        obj_fft_est = np.fft.fft2(obj_est)
+        for ff in range(frames):
+            # estimate the image function
+            img_est[:, :, ff] = np.real(np.fft.ifft2(obj_fft_est * otf_real[:, :, ff])) + bias_est
+            # the fourier transform of the data to image est ratio
+            ratio_fft_est[:, :, ff] = np.fft.fft2(data[:, :, ff] / img_est[:, :, ff])
+            # estimate the update for the object function
+            obj_updt[:, :, ff] = np.real(np.fft.ifft2(ratio_fft_est[:, :, ff] * otf_real[:, :, ff].conj()))
+
+        obj_est = obj_est * np.sum(obj_updt, 2) / frames
+        print(name + f' Iteration: {ii+1}/{its}')
+
+    return obj_est, img_est
+
