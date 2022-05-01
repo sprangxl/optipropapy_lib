@@ -18,6 +18,10 @@ PROPAGATION FUNCTIONS:
 
     fraunhofer_criteria
 
+    convert_to_psf_otf
+
+    distort_and_focus
+
 MASKING FUNCTIONS:
 
     circ_mask
@@ -31,12 +35,18 @@ ZERNIKE PHASE SCREEN FUNCTIONS (Tabs indicate sub-functions):
         atmos_phase_screen
 
     generate_zern_polys
-        zern_polye
+        zern_poly
             zern_indexes
             zrf
 
 PHASE RETRIEVAL
 
     gerschberg_saxton_phase_retrieve
+
+DECONVOLUTION
+
+    maxlikelihood_deconvolution
+
+    known_psf_deconvolution
 
 Test script (tests/optipropapy_tests.py) runs an example scenario using the functions in the library# optipropapy_lib
