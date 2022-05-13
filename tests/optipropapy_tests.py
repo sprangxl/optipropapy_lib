@@ -15,7 +15,7 @@ def test_optipropapy():
 
     # atmosphere variables
     zern_max = 100  # max number of zernikes used
-    r0 = 0.05  # fried's seeing parameter
+    r0 = 0.10  # fried's seeing parameter
     windx = 1  # wind in x direction
     windy = 1  # wind in y direction
     boil = 1  # atmospheric boil factor
@@ -24,8 +24,8 @@ def test_optipropapy():
     atm_flag = True  # if false, generic phase screen defaults to 1 frame instead of array of frames
 
     # optic variables
-    opt_diameter = 0.3  # diameter of the optic
-    sub_diameter = 0.05  # diameter of a sub-optic (can be zero)
+    opt_diameter = 0.2  # diameter of the optic
+    sub_diameter = 0.025  # diameter of a sub-optic (can be zero)
     focal_length = 2  # focal length of the optic
 
     # generate a source field, source field coordinates, and scene info/meta-data
@@ -35,7 +35,7 @@ def test_optipropapy():
     field_receive, coordinates_rx = opp.fresnel_prop(field_source, x_coordinates, distance, lam)
 
     # generate the zernike polynomials prior to generating atmosphere phase screens
-    zern, chol = opp.generate_zern_polys(zern_max, samples, opt_diameter, r0)
+    zern, chol = opp.generate_zern_polys(zern_max, samples/2, opt_diameter, r0)
 
     # generate phase screens using the zernike polynomials
     screens = opp.zern_phase_scrn(r0, opt_diameter, samples, zern_max, coordinates_rx,
@@ -47,7 +47,9 @@ def test_optipropapy():
     mask = opp.circ_mask(samples, size_receive, opt_diameter, sub_diameter)
 
     # element multiple field at optic by the mask and phase screen (note, screens = [samples x samples x frames])
-    field_distorted = field_receive * mask * np.exp(-1j * (lam * c) * screens[:, :, 0])
+    phase = mask * np.exp(-1j * (lam * c) * screens[:, :, 0])
+    psf, otf = opp.convert_to_psf_osf(phase)
+    field_distorted = field_receive * phase
 
     # focus receive field using fraunhofer propagation
     field_result, coordinates_rslt = opp.fraunhofer_prop(field_distorted, coordinates_rx, focal_length, lam, False)
@@ -60,7 +62,7 @@ def test_optipropapy():
 
     coord_min_rslt = min(coordinates_rslt)  # get coordinate's min to specify in extent
     coord_max_rslt = max(coordinates_rslt)  # get coordinate's max to specify in extent
-    field_mag_rslt = np.abs(field_result)  # magnitude of resultant field
+    field_mag_rslt = np.abs(field_result)**2  # magnitude of resultant field
 
     # define and display plots
     fig, ax = plt.subplots(2, 3)
@@ -78,11 +80,11 @@ def test_optipropapy():
     ax[1, 0].imshow(np.real(screens[:, :, 0]), extent=[coord_min_rx, coord_max_rx, coord_max_rx, coord_min_rx])
     ax[1, 0].set(title='Atmosphere Phase Screen')
     # mask
-    ax[1, 1].imshow(mask, extent=[coord_min_rx, coord_max_rx, coord_max_rx, coord_min_rx])
-    ax[1, 1].set(title='Optic Mask Function')
+    ax[1, 1].imshow(np.abs(psf), extent=[coord_min_rx, coord_max_rx, coord_max_rx, coord_min_rx])
+    ax[1, 1].set(title='Optic & Atmos PSF')
     # distorted field
     ax[1, 2].imshow(field_mag_rx, extent=[coord_min_rx, coord_max_rx, coord_max_rx, coord_min_rx])
-    ax[1, 2].set(title='Original Rx Field')
+    ax[1, 2].set(title='Non-Distorted Rx Field')
     plt.show()
 
 
