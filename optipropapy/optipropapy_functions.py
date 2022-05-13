@@ -4,12 +4,8 @@ import csv
 
 # external libraries
 import numpy as np
-import scipy.linalg as la
-import matplotlib.pyplot as plt
+import numpy.linalg as la
 from pathlib import Path
-
-# animation libraries
-from matplotlib.animation import FuncAnimation, PillowWriter
 
 
 # randomly gen space objects desired for detection
@@ -52,11 +48,27 @@ def gen_sourcefield_obj(n, sz, obj_sz, obj_xoff, obj_yoff, lu):
     # initialize source field array
     field_s = np.zeros((n + 1, n + 1))
 
+    # generate object with specific size and location
     xms, yms = np.meshgrid(x, x)
     mask = np.sqrt((xms-obj_xoff)**2 + (yms-obj_yoff)**2) < obj_sz
-    field_s[mask] = 1
+    field_s[mask] = lu
 
     return field_s, x
+
+
+# create object with pixel at a specific point (offset from center)
+def gen_sourcefield_pts(n, x_off, y_off, lu):
+    # create field coordinates
+    x_c = int(n / 2)
+    y_c = int(n / 2)
+
+    # initialize source field array
+    field_s = np.zeros((n + 1, n + 1))
+
+    # generate object with specific size and location
+    field_s[int(y_c + y_off), int(x_c + x_off)] = lu
+
+    return field_s
 
 
 # fresnel propagation utilizing fft
@@ -104,10 +116,6 @@ def fraunhofer_prop(field_s, xs_crd, zo, lam, focus_flag):
 # use rayleigh sommerfeld propagation on given source field
 def rayleigh_sommerfeld_prop(field_s, xs_crd, zo, lam, n_r, sz_r, xc, yc):
     xs_mgrid, ys_mgrid = np.meshgrid(xs_crd, xs_crd)  # meshgrids for source x & y
-
-    # Troubleshooting: use different method to generate coordinates
-    # xr_crd = np.arange(-np.floor(sz_r / 2), np.ceil(sz_r / 2)) * dx_r + xc  # array of received x-coordinates
-    # yr_crd = np.arange(-np.floor(sz_r / 2), np.ceil(sz_r / 2)) * dx_r + yc  # array of received y-coordinates
 
     xr_crd = np.arange(-sz_r / 2, (sz_r / 2) + (sz_r / n_r), sz_r / n_r) + xc
     yr_crd = np.arange(-sz_r / 2, (sz_r / 2) + (sz_r / n_r), sz_r / n_r) + yc
@@ -175,20 +183,21 @@ def sq_mask(n, sz, x_diam, y_diam):
 
 # make an otf of a pupil function with inner radius (radius2_px) and outer radius (radius1_px)
 def make_otf(radius1_px, radius2_px, source_px, scale, phase):
+    # generate an aperture
     aperture = np.zeros((source_px, source_px))
     coords = np.linspace(-source_px/2, source_px/2, source_px)
     xmat, ymat = np.meshgrid(coords, coords)
     distance_sq = (xmat**2 + ymat**2)
-
     aperture[distance_sq <= radius1_px**2] = 1
     aperture[distance_sq < radius2_px**2] = 0
 
-    pupil = aperture * np.cos(phase) + 1j * (aperture * np.sin(phase))
-    psf = np.real(np.fft.fft2(pupil)*np.conj(np.fft.fft2(pupil)))
-    psf = scale * psf / np.sum(pupil.flatten())
+    # generate pupil and psf from aperture
+    pupil = aperture * np.exp(1j * phase)
+    pupil_ifft = np.fft.ifftshift(np.fft.ifft2(np.fft.ifftshift(pupil)))
+    psf = np.real(pupil_ifft * np.conj(pupil_ifft))  # multiply by conjugate is real valued, 'np.real' for correct dtype
+    psf = scale * psf / np.sum(psf.flatten())
 
-    print('done')
-    return np.fft.fft2(psf), aperture
+    return np.fft.fftshift(np.fft.fft2(np.fft.fftshift(psf))), aperture
 
 
 # create phase screen from zernike polynomials
@@ -207,14 +216,14 @@ def zern_phase_scrn(ro, d, nn, zern_mx, x_crd, windx, windy, boil, deltat, frame
 def general_phase_screen(nn, zern_mx, zern, ch):
     # create random numbers to scale zernike polynomials
     rn = np.random.normal(size=(zern_mx - 1, 1))
-    z_cf = np.matmul(ch, rn)
+    z_coef = np.matmul(ch, rn)
 
     # initialize zernike phase screen
     zern_phs = np.zeros((nn + 1, nn + 1))
 
     # summations of randomly scaled zernike polynomials
     for ii in np.arange(0, zern_mx - 1):
-        zern_phs = zern_phs + z_cf[ii] * zern[ii, :, :]
+        zern_phs = zern_phs + z_coef[ii] * zern[ii, :, :]
 
     return zern_phs
 
@@ -222,6 +231,10 @@ def general_phase_screen(nn, zern_mx, zern, ch):
 # creates phase screens based on zernike polynom,ials and atmospheric variables
 def atmos_phase_screen(nn, ro, x_crd, windx, windy, boil, deltat, zern_mx, zern, ch, frames):
     a = 6.88
+
+    # increase size of the zernike polynomial spaces to allow for correlation calcs
+    zern2 = np.zeros((zern_mx - 1, nn + 1, nn + 1))
+    zern2[:, int(nn / 4):int(3 * nn / 4), int(nn / 4):int(3 * nn / 4)] = zern
 
     # get phase structure
     xm, ym = np.meshgrid(x_crd, x_crd)  # tau_x, tau_y
@@ -231,12 +244,12 @@ def atmos_phase_screen(nn, ro, x_crd, windx, windy, boil, deltat, zern_mx, zern,
     # denominator, Zernike sum of squares
     dnm = np.zeros((zern_mx - 1))
     for xx in np.arange(0, zern_mx - 1):
-        dnm[xx] = np.sum(np.sum(zern[xx, :, :] ** 2))
+        dnm[xx] = np.sum(np.sum(zern2[xx, :, :] ** 2))
 
     # FFT of all zernikes
     fft_mat = np.zeros((nn + 1, nn + 1, zern_mx - 1)) + 0j
     for jj in np.arange(0, zern_mx - 1):
-        fft_mat[:, :, jj] = np.fft.fft2(np.fft.fftshift(zern[jj, :, :]))
+        fft_mat[:, :, jj] = np.fft.fft2(np.fft.fftshift(zern2[jj, :, :]))
 
     # inner double sum integral
     idsi = np.zeros((zern_mx - 1, zern_mx - 1))
@@ -244,22 +257,19 @@ def atmos_phase_screen(nn, ro, x_crd, windx, windy, boil, deltat, zern_mx, zern,
         for yy in np.arange(0, zern_mx - 1):
             xcorr_fft = np.real(np.fft.fftshift(np.fft.ifft2(fft_mat[:, :, xx] * fft_mat[:, :, yy].conj())))
             idsi[xx, yy] = np.sum(np.sum(xcorr_fft * phs_struct / (dnm[xx] * dnm[yy])))
-            # For Troubleshooting: check xcorr results
-            # xcorr = signal.correlate2d(zern[xx, :, :], zern[yy, :, :])
-            # idsi[xx, yy] = np.sum(np.sum(xcorr * phs_struct / (dnm[xx] * dnm[yy])))
 
     # get n structure function from the phase structure function differences
     phi = la.inv(ch)
-    dn = np.zeros(zern_mx-1)
-    temp = np.zeros((zern_mx-1, zern_mx-1, zern_mx-1))
+    d_n = np.zeros(zern_mx-1)
+    phi_out = np.zeros((zern_mx-1, zern_mx-1, zern_mx-1))
     for ii in range(0, zern_mx-1):
-        temp[:, :, ii] = np.outer(phi[ii, :], phi[ii, :])
-        dn[ii] = np.sum(np.sum(idsi * temp[:, :, ii]))
+        phi_out[:, :, ii] = np.outer(phi[ii, :], phi[ii, :])
+        d_n[ii] = np.sum(np.sum(idsi * phi_out[:, :, ii]))
 
     # get the n-vector, and correlation functions
     r_0 = 1
-    r_n = r_0 - dn/2
-    r_n = np.clip(r_n, a_min=0, a_max=None).reshape((1, zern_mx-1))
+    r_n = r_0 - d_n/2
+    r_n = np.clip(r_n, a_min=0, a_max=1).reshape((1, zern_mx-1))
     n_vec = np.random.normal(size=(1, zern_mx - 1))
     cond_var = 1 - r_n**2
     cond_var = cond_var.reshape((1, zern_mx-1))
@@ -272,35 +282,10 @@ def atmos_phase_screen(nn, ro, x_crd, windx, windy, boil, deltat, zern_mx, zern,
         z_scale = ch @ n_vec.T
         z_record[:, ii] = np.squeeze(z_scale)
         for jj in np.arange(0, zern_mx - 1):
-            atm_lens_phs = atm_lens_phs + z_scale[jj] * zern[jj, :, :]
+            atm_lens_phs = atm_lens_phs + z_scale[jj] * zern2[jj, :, :]
         screens[:, :, ii] = atm_lens_phs
         cond_mean = n_vec * r_n
         n_vec = np.sqrt(cond_var) * np.random.normal(size=(zern_mx-1)) + cond_mean
-
-    # check what the screens look like (when flags == True) for toubleshooting only
-    check_screens_flag = False
-    create_animation_flag = False
-
-    # plot first four frames of phase screen
-    if check_screens_flag:
-        step = int(frames/4)  # assumes number of frames divisible by 4
-        fig, ax = plt.subplots(4, step)
-        for ii in range(0, 4):
-            for jj in range(0,  step):
-                ax[ii, jj].imshow(screens[:, :, jj + ii*4])
-                ax[ii, jj].axes.xaxis.set_visible(False)
-                ax[ii, jj].axes.yaxis.set_visible(False)
-        plt.tight_layout()
-        plt.show()
-
-    # create and save animation as animated gif
-    if create_animation_flag:
-        fig = plt.figure()
-        def AnimationFunction(f):
-            plt.imshow(screens[:, :, f])
-        ani = FuncAnimation(fig, AnimationFunction, frames=frames, interval=50)
-        writer = PillowWriter(fps=10)
-        ani.save('screens.gif', writer=writer)
 
     return screens
 
@@ -309,7 +294,7 @@ def atmos_phase_screen(nn, ro, x_crd, windx, windy, boil, deltat, zern_mx, zern,
 def generate_zern_polys(zern_mx, nn, d, ro):
     k = 2.2698
 
-    # create zernicke
+    # create zernike
     zern, idx = zern_poly(zern_mx + 1, nn)
     zern = zern[1: zern_mx, :, :]
 
@@ -331,8 +316,8 @@ def generate_zern_polys(zern_mx, nn, d, ro):
             test3 = p_even == p_p_even
             test0 = test2 | test3
             if test1 and test0:
-                k_zz = k * np.power(-1, (n[xx] + n[yy] - (2 * m[xx])) / 2) * np.sqrt((n[xx] + 1) * (n[xx] + 1))
-                num = k_zz * math.gamma((n[xx] + n[yy] - (5 / 3)) / 2) * np.power(d / ro, 5 / 3)
+                k_zz = k * (-1)**((n[xx] + n[yy] - (2 * m[xx])) / 2) * np.sqrt((n[xx] + 1) * (n[yy] + 1))
+                num = k_zz * math.gamma((n[xx] + n[yy] - (5 / 3)) / 2) * (d / ro)**(5 / 3)
                 dnm = math.gamma((n[xx] - n[yy] + 17 / 3) / 2) * math.gamma((n[yy] - n[xx] + 17 / 3) / 2) * \
                       math.gamma((n[xx] + n[yy] + 23 / 3) / 2)
                 covar[xx, yy] = num / dnm
@@ -408,3 +393,239 @@ def zrf(n, m, r):
         dnm = math.factorial(ii) * math.factorial(((n + m) / 2) - ii) * math.factorial(((n - m) / 2) - ii)
         rr = rr + (num / dnm) * r ** (n - (2 * ii))
     return rr
+
+
+def distort_and_focus(source, otf, z, lam, x_coord):
+    # get varaibles of field coordinates
+    nn = np.size(x_coord)
+    ll = np.max(x_coord) - np.min(x_coord)
+
+    # get the light field as seen at the optic
+    source_fft = np.fft.fft2(source)
+    field = source_fft * otf
+
+    # focus the field to the detector
+    scale_fact = 1 / (lam * z)
+    image = scale_fact * np.fft.ifft2(field)
+
+    # get the new coordinates at the detector
+    ds = ll / nn + 1
+    xr_coord = np.linspace(-(1 / ds) / 2, (1 / ds) / 2, nn + 1) * (lam * z)
+
+    return image, xr_coord
+
+
+# takes in data, 2D intensity array, and its (number of iterations)
+def gerschberg_saxton_phase_retrieve(data, apt, its, phs_init):
+    point = np.sqrt(np.abs(data))
+    pupil = apt
+    pupil_phs = pupil * np.exp(1j * phs_init)
+    point_phs = np.fft.fft2(pupil_phs)
+
+    # iterate GS
+    for it in range(its):
+        pupil_cmplx = np.abs(pupil) * np.exp(1j * np.angle(pupil_phs))
+        point_phs = np.fft.fft2(pupil_cmplx)
+        point_cmplx = np.abs(point) * np.exp(1j * np.angle(point_phs))
+        pupil_phs = np.fft.ifft2(point_cmplx)
+
+    pupil_phs = np.angle(pupil_phs)
+    psf_phs = np.angle(point_phs)
+    return pupil_phs, psf_phs, np.abs(point_phs)
+
+
+def convert_to_psf_otf(phs_screen):
+    phase_fft = np.fft.fft2(phs_screen)
+    psf = np.abs(phase_fft)**2
+    psf = psf / np.sum(psf.flatten())
+    otf = np.fft.fft2(psf)
+
+    return psf, otf
+
+
+def maxlikelihood_deconvolution(nn, frames, data, defocus, its, gs_its, name, psf_t, phases_t, obj_t):
+    # initialize variables
+    ap_est = circ_mask(nn, 1, 0.5, 0)
+    ap_est = np.fft.fftshift(ap_est)
+    phs_est = np.array(defocus)
+    psf_est, otf_est = convert_to_psf_otf(ap_est * np.exp(1j * phs_est))  # initial psf and otf estimates
+    obj_est = np.ones((nn + 1, nn + 1))
+
+    psf_est = np.repeat(np.expand_dims(psf_est, 2), frames, axis=2)
+    otf_est = np.repeat(np.expand_dims(otf_est, 2), frames, axis=2)
+    phs_est = np.repeat(np.expand_dims(phs_est, 2), frames, axis=2)
+    bias_est = np.median(data.flatten())
+
+    img_est = np.zeros((nn + 1, nn + 1, frames))
+    ratio_fft_est = np.zeros((nn + 1, nn + 1, frames)) + 0j
+    obj_updt = np.zeros((nn + 1, nn + 1, frames))
+    psf_updt = np.zeros((nn + 1, nn + 1, frames))
+
+    # run iteration
+    for ii in range(its):
+        obj_fft_est = np.fft.fft2(obj_est)
+        for ff in range(frames):
+            # estimate the image function
+            img_est[:, :, ff] = np.real(np.fft.ifft2(obj_fft_est * otf_est[:, :, ff])) + bias_est
+
+            # the fourier transform of the data to image est ratio
+            ratio_fft_est[:, :, ff] = np.fft.fft2(data[:, :, ff] / img_est[:, :, ff])
+
+            # estimate the update for the object function
+            obj_updt[:, :, ff] = np.real(np.fft.ifft2(ratio_fft_est[:, :, ff] * otf_est[:, :, ff].conj()))
+
+            # estimate the update for the psf
+            psf_updt[:, :, ff] = np.real(np.fft.ifft2(ratio_fft_est[:, :, ff] * obj_fft_est.conj()))
+
+            # get the new psf from the update
+            psf_est[:, :, ff] = np.abs(np.fft.ifft2(otf_est[:, :, ff])) * psf_updt[:, :, ff]
+            psf_est[:, :, ff] = psf_est[:, :, ff] / np.sum(psf_est[:, :, ff].flatten())
+
+            # estimate the phase of the phase of the psf
+            phs_est[:, :, ff], pupil_phs, point_est = \
+                gerschberg_saxton_phase_retrieve(psf_est[:, :, ff], ap_est, gs_its, phs_est[:, :, ff])
+
+            # convert phase of the psf to the otf estimate
+            psf_gs_est, otf_est[:, :, ff] = convert_to_psf_otf(ap_est * np.exp(1j * phs_est[:, :, ff]))
+
+        print(name + f' Iteration: {ii+1}/{its}')
+
+        obj_est = obj_est * np.sum(obj_updt, 2) / frames
+
+    return obj_est, img_est, otf_est
+
+
+def known_psf_deconvolution(nn, frames, data, its, otf_real, name):
+    obj_est = np.ones((nn + 1, nn + 1))  # object estimate
+    bias_est = np.median(data.flatten())
+
+    img_est = np.zeros((nn + 1, nn + 1, frames))
+    ratio_fft_est = np.zeros((nn + 1, nn + 1, frames)) + 0j
+    obj_updt = np.zeros((nn + 1, nn + 1, frames))
+    for ii in range(its):
+        obj_fft_est = np.fft.fft2(obj_est)
+        for ff in range(frames):
+            # estimate the image function
+            img_est[:, :, ff] = np.real(np.fft.ifft2(obj_fft_est * otf_real[:, :, ff])) + bias_est
+            # the fourier transform of the data to image est ratio
+            ratio_fft_est[:, :, ff] = np.fft.fft2(data[:, :, ff] / img_est[:, :, ff])
+            # estimate the update for the object function
+            obj_updt[:, :, ff] = np.real(np.fft.ifft2(ratio_fft_est[:, :, ff] * otf_real[:, :, ff].conj()))
+
+        obj_est = obj_est * np.sum(obj_updt, 2) / frames
+        print(name + f' Iteration: {ii+1}/{its}')
+
+    return obj_est, img_est
+
+
+def phs_unwrap_2d(phs, mask, its, err, xc, yc, cal):
+    # initialize variables
+    shp = np.shape(phs)
+    c13 = np.zeros(shp)
+    c4 = phs * mask
+
+    # iterate over phase unwrapping using discrete cosine transform coefficients
+    for ii in range(its):
+        c4_old = c4
+        c8 = cal_phs_unwrap_ls(c4, mask, cal)
+        c13 = c13 + c8
+        phs_avg = np.average(phs[np.max((0, np.max(xc-3))):np.min((shp[0], np.min(xc+3))),
+            np.max((0, np.max(yc-3))):np.min((shp[1], np.min(yc+3)))].flatten())
+        c13_avg = np.average(c13[np.max((0, np.max(xc-3))):np.min((shp[0], np.min(xc+3))),
+            np.max((0, np.max(yc-3))):np.min((shp[1], np.min(yc+3)))].flatten())
+        c13 = c13 + (phs_avg - c13_avg)
+        c10 = phs + 2 * np.pi * np.round((c13 - phs) / (2 * np.pi))
+        c4 = (c10 - c13) * mask
+
+        print(f'It: {ii}/{its}, & Err: {np.average(np.abs(c4 - c4_old).flatten())}')
+        if np.average(np.abs(c4 - c4_old).flatten()) < err:
+            break
+
+    phs_unwrap = c13
+    phs_cal = c10
+
+    return phs_unwrap, phs_cal
+
+
+def cal_phs_unwrap_ls(phs, mask, cal):
+    # initialize variables
+    cc = phs * mask
+    shp = np.shape(cc)
+    dx = np.zeros((shp[0], shp[1] + 1))
+    dy = np.zeros((shp[0] + 1, shp[1]))
+
+    # phs differences in x
+    dx[:, 1:shp[1]] = cc[:, 1:shp[1]] - cc[:, 0:shp[1]-1]
+    dx = np.angle(np.exp(1j * dx))
+    if cal:
+        gx = np.abs(np.average(dx.flatten()))
+        thx = np.std(dx.flatten())
+        dx[dx >= thx] = gx
+        dx[dx <= -thx] = -gx
+    dx[:, 0:shp[1]] = dx[:, 0:shp[1]] * mask
+    dx[:, 1:shp[1]+1] = dx[:, 1:shp[1]+1] * mask
+
+    # phs differences in y
+    dy[1:shp[0], :] = cc[1:shp[0], :] - cc[0:shp[0]-1, :]
+    dy = np.angle(np.exp(1j * dy))
+    if cal:
+        gy = np.abs(np.average(dy.flatten()))
+        thy = np.std(dy.flatten())
+        dy[dy >= thy] = gy
+        dy[dy <= -thy] = -gy
+    dy[0:shp[0], :] = dy[0:shp[1], :] * mask
+    dy[1:shp[0]+1, :] = dy[1:shp[1]+1, :] * mask
+
+    # dct (discrete cosine transform) values
+    c5 = (dx[:, 1:shp[1]+1] - dx[:, 0:shp[1]]) + (dy[1:shp[0]+1, :] - dy[0:shp[0], :])
+    c6 = dct2_type2(c5)
+    c7 = np.zeros(np.shape(c6))
+    for mm in range(shp[0]):
+        for nn in range(shp[1]):
+            if mm == 0 and nn == 0:
+                c7[mm, nn] = c6[mm, nn]
+            else:
+                dnm = (2 * (np.cos(np.pi * (mm-1)/shp[0]) + np.cos(np.pi * (nn - 1)/shp[1]) - 2))
+                if dnm == 0:
+                    c7[mm, nn] = 0
+                else:
+                    c7[mm, nn] = c6[mm, nn] / dnm
+
+    return dct2_type3(c7)
+
+
+# 2D discrete cosine transform type 2, equivalent to the idft type 3
+def dct2_type2(data):
+    shp = np.shape(data)
+    dct_val = np.zeros(shp)
+    ll = shp[0]  # assume square matrix
+    x = np.arange(0, np.pi, np.pi / ll) + (np.pi / (2 * ll))
+    for ii in range(ll):
+        for jj in range(ll):
+            c_ii = np.cos(ii * x)
+            c_jj = np.cos(jj * x)
+            c_ii = np.repeat(np.expand_dims(c_ii, 1), ll, 1)
+            c_jj = np.repeat(np.expand_dims(c_jj, 0), ll, 0)
+            c_mat = c_ii * c_jj
+
+            dct_val[ii, jj] = np.sum((data * c_mat).flatten()) / np.sum((c_mat**2).flatten())
+    return dct_val
+
+
+# 2D discrete cosine transform type 3, equivalent to the idft type 2
+def dct2_type3(data):
+    shp = np.shape(data)
+    dct_val = np.zeros(shp)
+    ll = shp[0]  # assume square matrix
+    x_mul = np.arange(0, np.pi, np.pi / ll)
+    x_add = np.arange(0, np.pi / 2, np.pi / 2 / ll)
+    for ii in range(ll):
+        for jj in range(ll):
+            c_ii = np.cos(ii * x_mul + x_add)
+            c_jj = np.cos(jj * x_mul + x_add)
+            c_ii = np.repeat(np.expand_dims(c_ii, 1), ll, 1)
+            c_jj = np.repeat(np.expand_dims(c_jj, 0), ll, 0)
+            c_mat = c_ii * c_jj
+
+            dct_val[ii, jj] = np.sum((data * c_mat).flatten())
+    return dct_val
